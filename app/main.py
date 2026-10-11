@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone, date
 from typing import Optional , Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException ,Query
 from pydantic import BaseModel , Field, model_validator
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError , DuplicateKeyError
@@ -45,7 +45,7 @@ def compute_late_minutes(punch_in: datetime, shift_start: str , attendance_date 
                                 h,
                                 m,
                                 tzinfo=IST)
-    elapsed_seconds = int((punch_in - shift_start_date).total_seconds() / 60)
+    elapsed_seconds = int((punch_in - shift_start_date).total_seconds())
 
     if elapsed_seconds <= 600:
         return 0
@@ -59,7 +59,12 @@ def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
 def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
     h, m = map(int, shift_end.split(":"))
     end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+    overtime = max(0, int((punch_out - end).total_seconds() / 60))
+
+    if overtime < 30:
+        return 0
+
+    return overtime
 
 
 # --------------------------------------------------------------------------- #
@@ -72,7 +77,7 @@ class EmployeeIn(BaseModel):
     department: str = Field(min_length= 1, max_length= 50)
     shift_start: str = Field(default="09:30", pattern= r'^([01]\d|2[0-3]):[0-5]\d$')
     shift_end: str = Field(default="18:30", pattern= r'^([01]\d|2[0-3]):[0-5]\d$')
-    joined_on: date
+    joined_on: date 
 
     @model_validator(mode = 'after')
     def validate_shifts(self):
@@ -93,8 +98,12 @@ class EmployeeOut(BaseModel):
 
 class PunchInIn(BaseModel):
     emp_code: str = Field(pattern= r"^EMP\d{4,6}$")
-    punched_at: Optional[int] = None
+    punched_at: Optional[int] = Field(default= None , le= 4102444800000, ge= 100000000000, strict= True)
     status: Literal["PRESENT","WFH","ON_DUTY"] = "PRESENT"
+
+class PunchOutIn(BaseModel):
+    emp_code: str = Field(pattern= r"^EMP\d{4,6}$")
+    punched_at: Optional[int] = Field(default= None , le= 4102444800000, ge= 100000000000, strict= True)
 
 
 # --------------------------------------------------------------------------- #
@@ -124,7 +133,9 @@ def create_employee(body: EmployeeIn):
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(department: Optional[str] = None,
+                    page: int = Query(default= 1, ge=1),
+                    page_size: int = Query(default= 20, ge=1, le= 100)):
     q = {}
     if department:
         q["department"] = department
@@ -141,6 +152,7 @@ def list_employees(department: Optional[str] = None, page: int = 1, page_size: i
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
+    
     emp = db.employees.find_one({"emp_code": body.emp_code})
     if emp is None:
         raise HTTPException(404 , 'Employee not found')
@@ -178,8 +190,8 @@ def list_attendance(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default= 20, ge = 1, le = 100),
 ):
     q = {}
     if emp_code:
@@ -211,3 +223,72 @@ def list_attendance(
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
+
+
+@app.post("/attendance/punch-out",status_code= 200)
+def punch_out(body : PunchOutIn):
+    emp = db.employees.find_one({"emp_code" : body.emp_code})
+
+    if emp is None:
+        raise HTTPException(404, "Employee Not Found")
+
+    punched_at = (datetime.fromtimestamp(body.punched_at / 1000, tz = timezone.utc)
+                  if body.punched_at is not None 
+                  else datetime.now(timezone.utc)).replace(microsecond = 0)
+    
+
+    record = db.attendance_logs.find_one({"emp_code" : body.emp_code,
+                                          "punch_in" : {"$ne" : None,"$lte" : punched_at}},
+                                          sort= [("punch_in", -1)])
+
+    if record is None:
+            raise HTTPException(404, "No open punch-in found")
+
+    if record['punch_out'] is not None:
+        raise HTTPException(409, "Attendance record already punched out")
+
+    punch_in = record['punch_in']
+
+    if punch_in.tzinfo is None:
+        punch_in = punch_in.replace(tzinfo = timezone.utc)
+
+    if punched_at <= punch_in:
+        raise HTTPException(422, 'Punch-out must be after punch-in')
+
+    if punched_at - punch_in > timedelta(hours = 24):
+        raise HTTPException(422, "Punch-out cannot be more than 24 hours after punch-in")
+
+    work_hours = compute_work_hours(punch_in,punched_at)
+    overtime_minutes = compute_overtime(punched_at,emp['shift_end'],record['date'])
+
+    half_day = work_hours < 4.50
+
+    result = db.attendance_logs.update_one({"_id": record["_id"],"punch_out" : None},
+                                  {"$set" : {
+                                      "punch_out" : punched_at,
+                                      "work_hours" : work_hours,
+                                      "overtime_minutes" :overtime_minutes,
+                                      "half_day" : half_day
+                                      }
+                                  })
+
+    if result.modified_count == 0:
+        raise HTTPException(409, "Attendance record already punched out")
+
+    updated_record = db.attendance_logs.find_one({"_id" : record["_id"]})
+    updated_record.pop("_id", None)
+
+    for field in ('punch_in', "punch_out"):
+        value = updated_record[field]
+
+        if value is not None:
+            if value.tzinfo is None:
+                value = value.replace(tzinfo = timezone.utc)
+                                                                      
+            updated_record[field] = int(value.timestamp() * 1000)
+
+    return updated_record
+
+@app.patch("/attendance/{emp_code}/{date}",status_code= 200)
+def attendance():
+    pass

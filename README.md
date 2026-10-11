@@ -1,26 +1,44 @@
-# Candidate kit
+# Employee Attendance & Analytics API
 
-Read in this order:
+FastAPI + MongoDB implementation for the HROne engineering assignment.
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+## Requirements
+- Python 3.11+
+- MongoDB 6.0+
 
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
+## Run locally
 
-## Local setup
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+# Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
-python sample_seed.py
-uvicorn app.main:app --port 8000 --reload
 ```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
 
-## Submit
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+Set environment variables `MONGO_URI` and `MONGO_DB`. For local development, a `.env` file is supported.
+
+```env
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=attendance_db
+```
+
+From the repository root:
+
+```bash
+uvicorn app.main:app --port 8000
+```
+
+The application creates its indexes at startup. To load the provided sample data, place `sample_seed.py` and the `sample_data/` folder at the repository root and run `python sample_seed.py`. Warning: the seed script deletes all existing documents in the two target collections before loading the sample records.
+
+## Endpoints
+- `GET /health`
+- `POST, GET /employees`
+- `POST /attendance/punch-in`
+- `POST /attendance/punch-out`
+- `GET /attendance`
+- `PATCH /attendance/{emp_code}/{date}`
+- `GET /analytics/employees/{emp_code}/monthly`
+- `GET /analytics/departments/summary`
+- `GET /analytics/leaderboard/late`
+- `GET /analytics/departments/{department}/trend`
+- `GET /admin/explain/{endpoint}`
+
