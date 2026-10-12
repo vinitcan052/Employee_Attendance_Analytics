@@ -571,6 +571,7 @@ def employee_monthly(emp_code : str, month : str):
         "$group" : {
             "_id" : None,
 
+
             "present_days" : {
                 "$sum" : {
                     "$cond" : [
@@ -612,6 +613,7 @@ def employee_monthly(emp_code : str, month : str):
                 }
             },
 
+
             "leave_days" : {
                 '$sum' : {
                     '$cond' : [
@@ -620,6 +622,7 @@ def employee_monthly(emp_code : str, month : str):
                     ]
                 }
             },
+
 
             "late_count" : {
                 "$sum" : {
@@ -632,6 +635,7 @@ def employee_monthly(emp_code : str, month : str):
                     ]
                 }
             },
+            
 
             "total_late_minutes" : {
                 "$sum" : {
@@ -639,11 +643,14 @@ def employee_monthly(emp_code : str, month : str):
                 }
             },
 
+
             'total_overtime_minutes' : {
                 '$sum' : {
                     '$ifNull' : ['$overtime_minutes', 0]
                 }
             }
+
+
         }
     }]
 
@@ -691,4 +698,253 @@ def employee_monthly(emp_code : str, month : str):
         'total_late_minutes' : summary['total_late_minutes'],
         "total_overtime_minutes" : summary['total_overtime_minutes'],
         "attendance_pct" : attendance_pct
+    }
+
+#   GET   /analytics/departments/summary
+@app.get("/analytics/departments/summary", status_code= 200)
+def department_summary(month : str, department : str = None):
+
+    try :
+        month_date = datetime.strptime(month, "%Y-%m").date()
+
+        if month_date.strftime('%Y-%m') != month:
+            raise ValueError()
+
+    except ValueError:
+        raise HTTPException(422, "Month must be in YYYY-MM format")
+
+    start_date = month + '-01'
+
+    if month_date.month == 12:
+        end_date = str(month_date.year + 1) + "-01-01"
+    else:
+        end_date = str(month_date.year) + "-" + str(month_date.month + 1).zfill(2) + "-01"
+
+    last_date = (datetime.strptime(end_date, "%Y-%m-%d").date() - timedelta(days = 1)).isoformat()
+
+    employee_match = {
+        "joined_on" : {"$lte" : last_date}
+    }
+
+    if department is not None:
+        employee_match["department"] = department
+
+    pipeline = [{
+        "$match" : employee_match
+    },
+
+
+
+    {
+        "$lookup" : {
+            "from" : "attendance_logs",
+            "let" : {
+                "employee_code" : '$emp_code'
+            },
+            "pipeline" : [{
+                "$match" : {
+                    "$expr" : {
+                        "$and" : [
+                            {"$eq" : ["$emp_code", "$$employee_code"]},
+                            {"$gte" : ["$date", start_date]},
+                            {"$lt" : ["$date", end_date]}
+                        ]
+                    }
+                }
+            }],
+            "as" : "attendance_records"
+        }
+    },
+
+
+
+    {
+        "$unwind" : {
+            "path" : '$attendance_records',
+            "preserveNullAndEmptyArrays" : True
+        }
+    },
+
+
+
+    {
+        "$group" : {
+            "_id" : {
+                "department" : "$department",
+                "emp_code" : "$emp_code"
+            },
+
+
+
+            "present_days" : {
+                "$sum" : {
+                    "$cond" : [
+                        {
+                            "$and" : [
+                                {"$in" : ["$attendance_records.status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                {"$in" : [
+                                    {"$dayOfWeek" : {"$dateFromString" : {"dateString" : "$attendance_records.date"}}},
+                                    [2, 3, 4, 5, 6]
+                                ]}
+                            ]
+                        },
+                        {
+                            "$cond" : [
+                                {"$eq" : ["$attendance_records.half_day", True]},
+                                0.5,
+                                1
+                            ]
+                        },
+                        0
+                    ]
+                }
+            },
+
+
+
+            "late_count" : {
+                "$sum" : {
+                    "$cond" : [
+                        {"$gt" : ["$attendance_records.late_minutes", 0]},
+                        1,
+                        0
+                    ]
+                }
+            },
+
+
+
+            "total_late_minutes" : {
+                "$sum" : {"$ifNull" : ["$attendance_records.late_minutes", 0]}
+            },
+
+
+
+            "leave_count" : {
+                "$sum" : {
+                    "$cond" : [
+                        {"$eq" : ["$attendance_records.status", "LEAVE"]},
+                        1,
+                        0
+                    ]
+                }
+            },
+
+
+
+            "on_duty_count" : {
+                "$sum" : {
+                    "$cond" : [
+                        {"$eq" : ["$attendance_records.status", "ON_DUTY"]},
+                        1,
+                        0
+                    ]
+                }
+            },
+
+
+
+            "work_hours_sum" : {
+                "$sum" : {
+                    "$cond" : [
+                        {
+                            "$and" : [
+                                {"$in" : ["$attendance_records.status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                {"$ne" : ["$attendance_records.work_hours", None]}
+                            ]
+                        },
+                        "$attendance_records.work_hours",
+                        0
+                    ]
+                }
+            },
+
+
+
+            "work_hours_count" : {
+                "$sum" : {
+                    "$cond" : [
+                        {
+                            "$and" : [
+                                {"$in" : ["$attendance_records.status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                {"$ne" : ["$attendance_records.work_hours", None]}
+                            ]
+                        },
+                        1,
+                        0
+                    ]
+                }
+            }
+        }
+    },
+
+
+
+    {
+        "$group" : {
+            "_id" : "$_id.department",
+            "headcount" : {"$sum" : 1},
+            "present_days" : {"$sum" : "$present_days"},
+            "late_count" : {"$sum" : "$late_count"},
+            "total_late_minutes" : {"$sum" : "$total_late_minutes"},
+            "leave_count" : {"$sum" : "$leave_count"},
+            "on_duty_count" : {"$sum" : "$on_duty_count"},
+            "work_hours_sum" : {"$sum" : "$work_hours_sum"},
+            "work_hours_count" : {"$sum" : "$work_hours_count"}
+        }
+    },
+
+
+
+    {
+        "$addFields" : {
+            "avg_work_hours" : {
+                "$cond" : [
+                    {"$gt" : ["$work_hours_count", 0]},
+                    {"$round" : [{"$divide" : ["$work_hours_sum", "$work_hours_count"]}, 2]},
+                    None
+                ]
+            }
+        }
+    },
+
+
+
+    {
+        '$match' : {
+            "headcount" : {'$gt' : 0}
+        }
+    },
+
+
+
+    {
+        "$project" : {
+            "_id" : 0,
+            "department" : "$_id",
+            "headcount" : 1,
+            "present_days" : 1,
+            "avg_work_hours" : 1,
+            "late_count" : 1,
+            "total_late_minutes" : 1,
+            "leave_count" : 1,
+            "on_duty_count" : 1
+        }
+    },
+
+
+
+    {
+        "$sort" : {
+            "department" : 1
+        }
+    }
+    ]
+
+
+    items = list(db.employees.aggregate(pipeline))
+
+    return {
+        "month" : month,
+        "items" : items
     }
