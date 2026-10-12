@@ -11,6 +11,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 from datetime import datetime, timedelta, timezone, date
 from typing import Optional , Literal
+from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException ,Query
@@ -104,6 +105,13 @@ class PunchInIn(BaseModel):
 class PunchOutIn(BaseModel):
     emp_code: str = Field(pattern= r"^EMP\d{4,6}$")
     punched_at: Optional[int] = Field(default= None , le= 4102444800000, ge= 100000000000, strict= True)
+
+class RegularizeIn(BaseModel):
+    status : Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
+    punch_in : Optional[int] = Field(default = None , le = 4102444800000, ge = 100000000000, strict = True)
+    punch_out : Optional[int] = Field(default = None , le = 4102444800000, ge = 100000000000, strict = True)
+    reason : str = Field(min_length= 5, max_length= 200)
+    regularized_by : str = Field(min_length= 5, max_length= 50)
 
 
 # --------------------------------------------------------------------------- #
@@ -224,7 +232,7 @@ def list_attendance(
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
 
-
+#   POST  /attendance/punch-out
 @app.post("/attendance/punch-out",status_code= 200)
 def punch_out(body : PunchOutIn):
     emp = db.employees.find_one({"emp_code" : body.emp_code})
@@ -289,6 +297,398 @@ def punch_out(body : PunchOutIn):
 
     return updated_record
 
+
+#   PATCH /attendance/{emp_code}/{date}
 @app.patch("/attendance/{emp_code}/{date}",status_code= 200)
-def attendance():
-    pass
+def attendance(emp_code : str,
+               date : str,
+               body: RegularizeIn):
+
+    try:
+        attendance_date = datetime.strptime(date, "%Y-%m-%d").date()
+
+        if attendance_date.isoformat() != date:
+            raise ValueError()
+
+    except ValueError:
+        raise HTTPException(422, "Date must be in YYYY-MM-DD format")
+
+    employee = db.employees.find_one({"emp_code" : emp_code})
+
+    if employee is None:
+        raise HTTPException(404 , "Employee not found")
+
+    record = db.attendance_logs.find_one({"emp_code" : emp_code,
+                                          "date" : date})
+
+    if record is None :
+        raise HTTPException(404 , "Attendance record not found")
+
+    if "punch_in" in body.model_fields_set and body.punch_in is None:
+        raise HTTPException(422, "punch_in cannot be null")
+
+    if "punch_out" in body.model_fields_set and body.punch_out is None:
+        raise HTTPException(422, "punch_out cannot be null")
+
+    updates = body.model_dump(exclude_unset = True,
+                              exclude = {"reason", "regularized_by"})
+
+    if not updates:
+        raise HTTPException(422, "At least one attendance field must be provided")
+
+    if updates.get('status') in ('ABSENT', "LEAVE"):
+        if "punch_in" in updates or "punch_out" in updates:
+            raise HTTPException(422, "ABSENT or LEAVE cannot be set with punch times")
+
+    punch_in = record.get("punch_in")
+    punch_out = record.get("punch_out")
+
+    if punch_in is not None:
+        punch_in = punch_in.replace(tzinfo = timezone.utc) if punch_in.tzinfo is None else punch_in
+        punch_in = punch_in.replace(microsecond = 0)
+
+    if punch_out is not None:
+        punch_out = punch_out.replace(tzinfo = timezone.utc) if punch_out.tzinfo is None else punch_out
+        punch_out = punch_out.replace(microsecond = 0)
+
+    if "punch_in" in updates:
+        punch_in = datetime.fromtimestamp(updates["punch_in"]/1000, tz = timezone.utc)
+        punch_in = punch_in.replace(microsecond = 0)
+
+    if "punch_out" in updates:
+        punch_out = datetime.fromtimestamp(updates["punch_out"]/1000, tz = timezone.utc)
+        punch_out = punch_out.replace(microsecond = 0)
+
+    final_status = updates.get("status", record["status"])
+
+    if final_status in ("ABSENT", "LEAVE"):
+        if "punch_in" in updates or "punch_out" in updates:
+            raise HTTPException(422, "ABSENT or LEAVE cannot be set with punch times")
+
+        punch_in = None
+        punch_out = None
+
+    if punch_in is not None and punch_out is not None:
+        if punch_out <= punch_in:
+            raise HTTPException(422, "punch_out must be after punch_in")
+
+        if punch_out - punch_in > timedelta(hours= 24):
+            raise HTTPException(422, "punch_out cannot be more than 24 hours after punch_in")
+
+    if final_status in ("PRESENT", "WFH", "ON_DUTY") and punch_in is None:
+        raise HTTPException(422, "A punch_in is required for presence statuses")
+
+    ist = timezone(timedelta(hours =5 , minutes = 30))
+
+    if punch_in is not None:
+        punch_in_ist = punch_in.astimezone(ist)
+
+        expected_date = punch_in_ist.date()
+
+        shift_start = employee["shift_start"]
+        shift_end = employee["shift_end"]
+
+        if shift_end <= shift_start and punch_in_ist.strftime("%H:%M") < shift_end:
+            expected_date = expected_date - timedelta(days = 1)
+
+        if expected_date.isoformat() != date:
+            raise HTTPException(422, "punch_in must fall on the attendance date in IST")
+
+    final_values = {
+        "status" : final_status,
+        "punch_in" : punch_in,
+        "punch_out" : punch_out
+    }
+
+    late_minutes = 0
+    work_hours = None
+    overtime_minutes = 0
+    half_day = False
+
+    if punch_in is not None:
+        late_minutes = compute_late_minutes(
+            punch_in,
+            employee["shift_start"],
+            date
+        )
+
+    if punch_in is not None and punch_out is not None:
+        from decimal import Decimal, ROUND_HALF_UP
+
+        seconds = Decimal(str((punch_out - punch_in).total_seconds()))
+        work_hours = float((seconds / Decimal("3600")).quantize(
+            Decimal("0.01"), rounding = ROUND_HALF_UP
+        ))
+
+        shift_start = employee["shift_start"]
+        shift_end = employee["shift_end"]
+
+        shift_date = attendance_date
+        punch_in_ist = punch_in.astimezone(ist)
+
+        if shift_end <= shift_start and punch_in_ist.strftime("%H:%M") < shift_end:
+            shift_date = shift_date + timedelta(days = 1)
+
+        shift_end_hour, shift_end_minute = map(int, shift_end.split(":"))
+
+        shift_end_time = datetime(
+            shift_date.year,
+            shift_date.month,
+            shift_date.day,
+            shift_end_hour,
+            shift_end_minute,
+            tzinfo = ist
+        )
+
+        overtime_elapsed = int(
+            (punch_out.astimezone(ist) - shift_end_time).total_seconds() // 60
+        )
+
+        if overtime_elapsed >= 30:
+            overtime_minutes = overtime_elapsed
+
+        half_day = work_hours < 4.50
+
+    final_values.update({
+        "late_minutes" : late_minutes,
+        "work_hours" : work_hours,
+        "overtime_minutes" : overtime_minutes,
+        "half_day" : half_day
+    })
+
+    changes = {}
+
+    for field in ("status", "punch_in", "punch_out",
+                  "work_hours", "late_minutes", "overtime_minutes", "half_day"):
+
+        old_value = record.get(field)
+
+        if field in ("punch_in", "punch_out") and old_value is not None:
+            if old_value.tzinfo is None:
+                old_value = old_value.replace(tzinfo = timezone.utc)
+
+            old_value = old_value.replace(microsecond = 0)
+
+        if field in ("late_minutes", "overtime_minutes") and old_value is None:
+            old_value = 0
+
+        if field == "half_day" and old_value is None:
+            old_value = False
+
+        new_value = final_values[field]
+
+        if old_value != new_value:
+            changes[field] = {
+                "from" : old_value,
+                "to" : new_value
+            }
+
+    if not changes:
+        raise HTTPException(422, "The request does not change any attendance fields")
+
+    history_entry = {
+        "at" : datetime.now(timezone.utc),
+        "by" : body.regularized_by,
+        "reason" : body.reason,
+        "changes" : changes
+    }
+
+    result = db.attendance_logs.update_one(
+        {
+            "_id" : record["_id"],
+            "history" : record.get("history", [])
+        },
+        {
+            "$set" : final_values,
+            "$push" : {"history" : history_entry}
+        }
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(409 , "Attendance record was changed by another request")
+
+    updated_record = db.attendance_logs.find_one({"_id" : record["_id"]})
+
+    updated_record.pop("_id", None)
+
+    for field in ("punch_in", "punch_out"):
+        if updated_record[field] is not None:
+            updated_record[field] = int(updated_record[field].replace(
+                tzinfo = timezone.utc
+            ).timestamp() * 1000)
+
+    for entry in updated_record["history"]:
+        entry["at"] = int(entry["at"].replace(
+            tzinfo = timezone.utc
+        ).timestamp() * 1000)
+
+        for field, change in entry["changes"].items():
+            if field in ("punch_in", "punch_out"):
+                for key in ("from", "to"):
+                    value = change[key]
+
+                    if value is not None and isinstance(value, datetime):
+                        change[key] = int(value.replace(
+                            tzinfo = timezone.utc
+                        ).timestamp() * 1000)
+
+    return updated_record
+
+#   GET   /analytics/employees/{emp_code}/monthly
+@app.get("/analytics/employees/{emp_code}/monthly", status_code= 200)
+def employee_monthly(emp_code : str, month : str):
+
+    try :
+        month_date = datetime.strptime(month, "%Y-%m").date()
+
+        if month_date.strftime('%Y-%m') != month:
+            raise ValueError()
+
+    except ValueError:
+        raise HTTPException(422, "Month must be in YYYY-MM format")
+
+    employee = db.employees.find_one({'emp_code' : emp_code})
+
+    if employee is None :
+        raise HTTPException(404 , "Employee not found")
+
+    start_date = month + "-01"
+
+    if month_date.month == 12:
+        end_date = str(month_date.year + 1) + "-01-01"
+    else:
+        end_date = str(month_date.year) + "-" + str(month_date.month + 1).zfill(2) + "-01"
+
+    pipeline = [{
+        "$match" : {
+            "emp_code" : emp_code,
+            "date" : {
+                '$gte' : start_date,
+                "$lt" : end_date
+            }
+        }
+    },{
+        "$group" : {
+            "_id" : None,
+
+            "present_days" : {
+                "$sum" : {
+                    "$cond" : [
+                        {
+                            "$and" : [
+                                {"$in" : [
+                                    "$status",
+                                    ["PRESENT", "WFH", "ON_DUTY"]
+                                ]},
+                                {"$gte" : [
+                                    {"$dayOfWeek" : {
+                                        "$dateFromString" : {
+                                            "dateString" : "$date",
+                                            "format" : "%Y-%m-%d"
+                                        }
+                                    }},
+                                    2
+                                ]},
+                                {"$lte" : [
+                                    {"$dayOfWeek" : {
+                                        "$dateFromString" : {
+                                            "dateString" : "$date",
+                                            "format" : "%Y-%m-%d"
+                                        }
+                                    }},
+                                    6
+                                ]}
+                            ]
+                        },
+                        {
+                            "$cond" : [
+                                {"$eq" : ["$half_day", True]},
+                                0.5,
+                                1
+                            ]
+                        },
+                        0
+                    ]
+                }
+            },
+
+            "leave_days" : {
+                '$sum' : {
+                    '$cond' : [
+                        {'$eq' : ['$status', 'LEAVE']},
+                        1,0
+                    ]
+                }
+            },
+
+            "late_count" : {
+                "$sum" : {
+                    '$cond' : [
+                        {"$gt" : [
+                            {'$ifNull' : ['$late_minutes', 0]},
+                            0
+                        ]},
+                        1,0
+                    ]
+                }
+            },
+
+            "total_late_minutes" : {
+                "$sum" : {
+                    "$ifNull" : ["$late_minutes", 0]
+                }
+            },
+
+            'total_overtime_minutes' : {
+                '$sum' : {
+                    '$ifNull' : ['$overtime_minutes', 0]
+                }
+            }
+        }
+    }]
+
+    joined_date = datetime.strptime(employee['joined_on'], "%Y-%m-%d").date()
+
+    first_date = max(month_date, joined_date)
+    last_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+
+    working_days = 0
+    current_date = first_date
+
+    while current_date < last_date:
+        if current_date.weekday() < 5:
+            working_days += 1
+
+        current_date += timedelta(days = 1)
+
+    result = list(db.attendance_logs.aggregate(pipeline))
+
+    if result:
+        summary = result[0]
+    else :
+        summary = {
+            "present_days" : 0,
+            "leave_days" : 0,
+            "late_count" : 0,
+            "total_late_minutes" : 0,
+            "total_overtime_minutes" : 0
+        }
+
+    present_days = summary['present_days']
+
+    if working_days == 0 :
+        attendance_pct = None
+    else :
+        attendance_pct = round(present_days / working_days * 100, 2)
+
+    return {
+        "emp_code" : emp_code,
+        "month" : month,
+        "working_days" : working_days,
+        "present_days" : present_days,
+        "leave_days" : summary['leave_days'],
+        "late_count" : summary['late_count'],
+        'total_late_minutes' : summary['total_late_minutes'],
+        "total_overtime_minutes" : summary['total_overtime_minutes'],
+        "attendance_pct" : attendance_pct
+    }
