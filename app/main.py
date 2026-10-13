@@ -11,7 +11,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 from datetime import datetime, timedelta, timezone, date
 from typing import Optional , Literal
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException ,Query
@@ -413,12 +413,8 @@ def attendance(emp_code : str,
         )
 
     if punch_in is not None and punch_out is not None:
-        from decimal import Decimal, ROUND_HALF_UP
-
         seconds = Decimal(str((punch_out - punch_in).total_seconds()))
-        work_hours = float((seconds / Decimal("3600")).quantize(
-            Decimal("0.01"), rounding = ROUND_HALF_UP
-        ))
+        work_hours = float((seconds / Decimal("3600")))
 
         shift_start = employee["shift_start"]
         shift_end = employee["shift_end"]
@@ -946,5 +942,124 @@ def department_summary(month : str, department : str = None):
 
     return {
         "month" : month,
+        "items" : items
+    }
+
+
+#   GET   /analytics/leaderboard/late
+@app.get("/analytics/leaderboard/late", status_code= 200)
+def late_leaderboard(month : str, limit : int = Query(default=10, ge=1, le=50), department : str = None):
+
+    try :
+        month_date = datetime.strptime(month, "%Y-%m").date()
+
+        if month_date.strftime('%Y-%m') != month:
+            raise ValueError()
+
+    except ValueError:
+        raise HTTPException(422, "Month must be in YYYY-MM format")
+
+    start_date = month + '-01'
+
+    if month_date.month == 12:
+        end_date = str(month_date.year + 1) + "-01-01"
+    else:
+        end_date = str(month_date.year) + "-" + str(month_date.month + 1).zfill(2) + "-01"
+
+    pipeline = [
+        {
+            "$match" : {
+                "date" : {
+                    "$gte" : start_date,
+                    "$lt" : end_date
+                }
+            }
+        },
+
+        {
+            "$group" : {
+                "_id" : "$emp_code",
+                "total_late_minutes" : {
+                    "$sum" : {"$ifNull" : ["$late_minutes", 0]}
+                }
+            }
+        },
+
+        {
+            "$match" : {
+                "total_late_minutes" : {"$gt" : 0}
+            }
+        },
+
+        {
+            "$lookup" : {
+                "from" : "employees",
+                "localField" : "_id",
+                "foreignField" : "emp_code",
+                "as" : "employee"
+            }
+        },
+
+        {
+            '$unwind' : "$employee"
+        }
+    ]
+
+    if department is not None:
+        pipeline.append({
+            "$match" : {
+                "employee.department" : department
+            }
+        })
+
+    pipeline.extend([
+        {
+            '$set' : {
+                "emp_code" : "$_id",
+                "name" : "$employee.name",
+                "department" : "$employee.department"
+            }
+        },
+
+        {
+            "$setWindowFields" : {
+                "sortBy" : {
+                    "total_late_minutes" : -1
+                },
+                "output" : {
+                    "rank" : {"$rank" : {}}
+                }
+            }
+        },
+
+        {
+            "$match" : {
+                'rank' : {"$lte" : limit}
+            }
+        },
+
+        {
+            "$sort" : {
+                "total_late_minutes" : -1,
+                "emp_code" : 1
+            }
+        },
+
+        {
+            "$project" : {
+                "_id" : 0,
+                "rank" : 1,
+                "emp_code" : 1,
+                "name" : 1,
+                "department" : 1,
+                "total_late_minutes" : 1
+            }
+        }
+    ])
+
+    items = list(db.attendance_logs.aggregate(pipeline))
+
+    return {
+        'month' : month,
         "items" : items
     }
