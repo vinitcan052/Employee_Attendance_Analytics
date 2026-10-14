@@ -1063,3 +1063,185 @@ def late_leaderboard(month : str, limit : int = Query(default=10, ge=1, le=50), 
         'month' : month,
         "items" : items
     }
+
+
+#   GET   /analytics/departments/{department}/trend
+@app.get("/analytics/departments/{department}/trend", status_code= 200)
+def department_trend(department : str, from_date : str = Query(alias="from"), to : str = Query()):
+
+    try:
+        start_date = datetime.strptime(from_date, "%Y-%m-%d").date()
+        end_date = datetime.strptime(to, "%Y-%m-%d").date()
+
+        if start_date.isoformat() != from_date or end_date.isoformat() != to:
+            raise ValueError()
+
+    except ValueError:
+        raise HTTPException(422, "Dates must be in YYYY-MM-DD format")
+
+    if end_date < start_date:
+        raise HTTPException(422, "to must be on or after from")
+
+    if (end_date - start_date).days + 1 > 92:
+        raise HTTPException(422, "Date range cannot exceed 92 days")
+
+    employee = db.employees.find_one({"department" : department})
+
+    if employee is None:
+        raise HTTPException(404, "Department not found")
+
+
+    pipeline = [
+        {
+            "$match" : {
+                "department" : department
+            }
+        },
+        {
+            "$lookup" : {
+                "from" : "attendance_logs",
+                "let" : {
+                    "employee_code" : "$emp_code"
+                },
+                "pipeline" : [
+                    {
+                        "$match" : {
+                            "$expr" : {
+                                "$and" : [
+                                    {"$eq" : ["$emp_code", "$$employee_code"]},
+                                    {"$gte" : ["$date", from_date]},
+                                    {"$lte" : ["$date", to]}
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "as" : "attendance_records"
+            }
+        },
+        {
+            "$unwind" : "$attendance_records"
+        },
+        {
+            "$group" : {
+                "_id" : {
+                    "date" : "$attendance_records.date",
+                    "emp_code" : "$emp_code"
+                },
+                "status" : {"$first" : "$attendance_records.status"},
+                "half_day" : {"$first" : "$attendance_records.half_day"},
+                "late_minutes" : {"$first" : "$attendance_records.late_minutes"}
+            }
+        },
+        {
+            "$group" : {
+                "_id" : "$_id.date",
+                "present_count" : {
+                    "$sum" : {
+                        "$cond" : [
+                            {"$in" : ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                            {"$cond" : [{"$eq" : ["$half_day", True]}, 0.5, 1]},
+                            0
+                        ]
+                    }
+                },
+                "late_count" : {
+                    "$sum" : {
+                        "$cond" : [
+                            {"$gt" : [{"$ifNull" : ["$late_minutes", 0]}, 0]},
+                            1,
+                            0
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "$sort" : {
+                "_id" : 1
+            }
+        }
+    ]
+
+    results = list(db.employees.aggregate(pipeline))
+
+    attendance_by_date = {}
+
+    for result in results:
+        result_date = result["_id"]
+
+        if isinstance(result_date, datetime):
+            result_date = result_date.strftime("%Y-%m-%d")
+
+        attendance_by_date[result_date] = result
+
+    employees = list(db.employees.find({"department" : department}))
+
+    items = []
+    current_date = start_date
+
+    while current_date <= end_date:
+
+        day = current_date.strftime("%Y-%m-%d")
+        is_working_day = current_date.weekday() < 5
+
+        headcount = 0
+
+        for emp in employees:
+            joined_on = emp.get("joined_on")
+
+            if isinstance(joined_on, datetime):
+                joined_on = joined_on.date()
+
+            if isinstance(joined_on, str):
+                try:
+                    joined_on = datetime.strptime(joined_on, "%d-%m-%Y").date()
+                except ValueError:
+                    joined_on = datetime.strptime(joined_on, "%Y-%m-%d").date()
+
+            if joined_on and joined_on <= current_date:
+                headcount += 1
+
+        result = attendance_by_date.get(day, {})
+
+        present_count = result.get("present_count", 0)
+        late_count = result.get("late_count", 0)
+
+        attendance_rate = None
+
+        if is_working_day and headcount > 0:
+            attendance_rate = round(present_count / headcount, 4)
+
+        previous_rates = [
+            item["attendance_rate"]
+            for item in items[-6:]
+            if item["attendance_rate"] is not None
+        ]
+
+        if attendance_rate is not None:
+            previous_rates.append(attendance_rate)
+
+        if previous_rates:
+            moving_avg_7d = round(sum(previous_rates) / len(previous_rates), 4)
+        else:
+            moving_avg_7d = None
+
+        items.append({
+            "date" : day,
+            "is_working_day" : is_working_day,
+            "headcount" : headcount,
+            "present_count" : present_count,
+            "late_count" : late_count,
+            "attendance_rate" : attendance_rate,
+            "moving_avg_7d" : moving_avg_7d
+        })
+
+        current_date += timedelta(days=1)
+
+    return {
+        "department" : department,
+        "from" : from_date,
+        "to" : to,
+        "items" : items
+    }
+
