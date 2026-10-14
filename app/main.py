@@ -26,7 +26,7 @@ db = client[os.getenv("MONGO_DB")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0") 
 
 @app.on_event('startup')
 def create_indexes():
@@ -1245,3 +1245,255 @@ def department_trend(department : str, from_date : str = Query(alias="from"), to
         "items" : items
     }
 
+#   GET   /admin/explain/{endpoint}
+@app.get("/admin/explain/{endpoint}", status_code= 200)
+def explain_endpoint(
+    endpoint : str,
+    emp_code : str = None,
+    month : str = None,
+    department : str = None,
+    limit : int = Query(default= 10, ge=1, le= 50),
+    date_from : str = Query(None, alias="date_from", format="date"),
+    date_to : str = Query(None, alias="date_to", format="date"),
+    status : str = None,
+    from_date : str = Query(None, alias="from", format="date"),
+    to_date : str = Query(None, alias="to", format="date"),
+    page : int = Query(default=1, ge= 1),
+    page_size : int = Query(default=20, ge=1, le= 100)
+):
+
+    allowed_endpoints = ["attendance_list",
+                         "employee_monthly",
+                         "department_summary",
+                         "late_leaderboard",
+                         "department_trend"]
+
+    if endpoint not in allowed_endpoints:
+        raise HTTPException(422, "Invalid endpoint name")
+
+    query = {}
+    collection = "attendance_logs"
+
+    if endpoint == "attendance_list":
+
+        if emp_code:
+            query["emp_code"] = emp_code
+
+        if status:
+            query["status"] = status
+
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(422, "date_from cannot exceed date_to")
+
+        if date_from or date_to:
+            query["date"] = {}
+
+            if date_from:
+                query["date"]["$gte"] = date_from
+
+            if date_to:
+                query["date"]["$lte"] = date_to
+
+        explain_result = db.command(
+            "explain",
+            {
+                "find": "attendance_logs",
+                "filter": query,
+                "sort": {"date": -1, "emp_code": 1},
+                "skip": (page - 1) * page_size,
+                "limit": page_size
+            },
+            verbosity="executionStats"
+        )
+
+    else:
+
+        if endpoint == "employee_monthly" and not emp_code:
+            raise HTTPException(422, "emp_code is required")
+
+        if endpoint in ["employee_monthly",
+                        "department_summary",
+                        "late_leaderboard"] and not month:
+            raise HTTPException(422, "month is required")
+
+        if endpoint == "department_trend":
+
+            if not department or not from_date or not to_date:
+                raise HTTPException(
+                    422, "department, from and to are required"
+                )
+
+            if from_date > to_date:
+                raise HTTPException(422, "to cannot be before from")
+
+            query = [
+                {
+                    "$match": {
+                        "date": {
+                            "$gte": from_date,
+                            "$lte": to_date
+                        }
+                    }
+                },
+                {
+                    "$lookup": {
+                        "from": "employees",
+                        "localField": "emp_code",
+                        "foreignField": "emp_code",
+                        "as": "employee"
+                    }
+                },
+                {"$unwind": "$employee"},
+                {
+                    "$match": {
+                        "employee.department": department
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$date",
+                        "present_count": {
+                            "$sum": {
+                                "$cond": [
+                                    {
+                                        "$in": [
+                                            "$status",
+                                            ["PRESENT", "WFH", "ON_DUTY"]
+                                        ]
+                                    },
+                                    1,
+                                    0
+                                ]
+                            }
+                        },
+                        "late_count": {
+                            "$sum": {
+                                "$cond": [
+                                    {"$gt": ["$late_minutes", 0]},
+                                    1,
+                                    0
+                                ]
+                            }
+                        }
+                    }
+                }
+            ]
+
+        else:
+
+            try:
+                month_date = datetime.strptime(month, "%Y-%m")
+            except ValueError:
+                raise HTTPException(422, "Month must be in YYYY-MM format")
+
+            if month_date.strftime("%Y-%m") != month:
+                raise HTTPException(422, "Month must be in YYYY-MM format")
+
+            start_date = month + "-01"
+
+            if month_date.month == 12:
+                end_date = str(month_date.year + 1) + "-01-01"
+            else:
+                end_date = (
+                    str(month_date.year) + "-"
+                    + str(month_date.month + 1).zfill(2) + "-01"
+                )
+
+            match_query = {
+                "date": {
+                    "$gte": start_date,
+                    "$lt": end_date
+                }
+            }
+
+            query = [
+                {"$match": match_query}
+            ]
+
+            if endpoint == "employee_monthly":
+
+                query[0]["$match"]["emp_code"] = emp_code
+
+                query.append({
+                    "$group": {
+                        "_id": "$emp_code",
+                        "total_late_minutes": {
+                            "$sum": {"$ifNull": ["$late_minutes", 0]}
+                        },
+                        "total_overtime_minutes": {
+                            "$sum": {"$ifNull": ["$overtime_minutes", 0]}
+                        }
+                    }
+                })
+
+            elif endpoint == "department_summary":
+
+                query.append({
+                    "$lookup": {
+                        "from": "employees",
+                        "localField": "emp_code",
+                        "foreignField": "emp_code",
+                        "as": "employee"
+                    }
+                })
+
+                query.append({"$unwind": "$employee"})
+
+                if department:
+                    query.append({
+                        "$match": {
+                            "employee.department": department
+                        }
+                    })
+
+                query.append({
+                    "$group": {
+                        "_id": "$employee.department",
+                        "record_count": {"$sum": 1},
+                        "total_late_minutes": {
+                            "$sum": {"$ifNull": ["$late_minutes", 0]}
+                        }
+                    }
+                })
+
+            elif endpoint == "late_leaderboard":
+
+                query.append({
+                    "$match": {
+                        "late_minutes": {"$gt": 0}
+                    }
+                })
+
+                query.append({
+                    "$group": {
+                        "_id": "$emp_code",
+                        "total_late_minutes": {
+                            "$sum": "$late_minutes"
+                        }
+                    }
+                })
+
+                query.append({
+                    "$sort": {
+                        "total_late_minutes": -1,
+                        "_id": 1
+                    }
+                })
+
+                query.append({"$limit": limit})
+
+        explain_result = db.command(
+            "explain",
+            {
+                "aggregate": "attendance_logs",
+                "pipeline": query,
+                "cursor": {}
+            },
+            verbosity="executionStats"
+        )
+
+    return {
+        "endpoint": endpoint,
+        "collection": collection,
+        "explain": explain_result
+    }
